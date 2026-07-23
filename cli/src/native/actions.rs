@@ -13177,6 +13177,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[derive(Default)]
     struct PausedWorkerProtocolState {
+        close_attempted: bool,
         detached: bool,
         paused: bool,
         resumed: bool,
@@ -13189,6 +13190,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         DaemonState,
         tokio::sync::mpsc::UnboundedSender<()>,
         Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Mutex<PausedWorkerProtocolState>>,
         tokio::task::JoinHandle<()>,
     ) {
         use futures_util::{SinkExt, StreamExt};
@@ -13266,6 +13268,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                                 }));
                             }
                             "Target.closeTarget" => {
+                                protocol_state_for_server.lock().await.close_attempted = true;
                                 result = match close_reply {
                                     WorkerCloseReply::Rejected => {
                                         Some(json!({ "success": false }))
@@ -13328,12 +13331,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
 
-        (state, attach_tx, recovered, server)
+        (state, attach_tx, recovered, protocol_state, server)
     }
 
     #[tokio::test]
     async fn rejected_worker_close_resumes_and_detaches_before_following_commands() {
-        let (mut state, attach_tx, recovered, server) =
+        let (mut state, attach_tx, recovered, _protocol_state, server) =
             state_with_paused_worker_protocol(WorkerCloseReply::Rejected, false).await;
 
         attach_tx.send(()).unwrap();
@@ -13362,7 +13365,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn timed_out_worker_close_resumes_and_detaches_before_following_commands() {
-        let (mut state, attach_tx, recovered, server) =
+        let (mut state, attach_tx, recovered, _protocol_state, server) =
             state_with_paused_worker_protocol(WorkerCloseReply::Timeout, false).await;
 
         attach_tx.send(()).unwrap();
@@ -13389,16 +13392,64 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         server.await.unwrap();
     }
 
-    fn spawn_sleeping_test_process() -> std::process::Child {
+    #[tokio::test]
+    async fn worker_control_failure_drains_and_disposes_without_blocking_the_command_lane() {
+        let (mut state, attach_tx, _recovered, protocol_state, server) =
+            state_with_paused_worker_protocol(WorkerCloseReply::Rejected, true).await;
+        state
+            .fetch_handler_task
+            .take()
+            .expect("fetch handler")
+            .abort();
+        let worker_process = spawn_sleeping_test_process(5);
+        let worker_process_id = worker_process.id();
+        state
+            .browser
+            .as_mut()
+            .expect("browser manager")
+            .set_owned_chrome_process_for_test(worker_process);
+
+        attach_tx.send(()).unwrap();
+        let drain = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let result = state.drain_cdp_events_background().await;
+                if result.is_err() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker failure recovery and browser disposal must stay short-bounded");
+        assert!(drain.is_err());
+
+        let protocol_state = protocol_state.lock().await;
+        assert!(protocol_state.close_attempted);
+        assert!(protocol_state.resumed);
+        assert!(protocol_state.detached);
+        assert!(!protocol_state.paused);
+        drop(protocol_state);
+
+        assert!(state.browser.is_none());
+        assert!(!crate::connection::is_pid_alive(worker_process_id));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.drain_cdp_events_background(),
+        )
+        .await
+        .expect("the following command-lane drain must not remain blocked")
+        .expect("a disposed browser should leave no pending CDP events");
+
+        drop(attach_tx);
+        server.await.unwrap();
+    }
+
+    fn spawn_sleeping_test_process(seconds: u64) -> std::process::Child {
         #[cfg(windows)]
         {
             std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Start-Sleep -Seconds 30",
-                ])
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg(format!("Start-Sleep -Seconds {seconds}"))
                 .spawn()
                 .expect("spawn sleeping test process")
         }
@@ -13406,7 +13457,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         #[cfg(unix)]
         {
             std::process::Command::new("sh")
-                .args(["-c", "sleep 30"])
+                .args(["-c", &format!("sleep {seconds}")])
                 .spawn()
                 .expect("spawn sleeping test process")
         }
@@ -13414,13 +13465,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn network_control_failure_cleanup_is_short_bounded() {
-        let (mut state, attach_tx, _recovered, server) =
+        let (mut state, attach_tx, _recovered, _protocol_state, server) =
             state_with_paused_worker_protocol(WorkerCloseReply::Rejected, true).await;
         state
             .browser
             .as_mut()
             .expect("browser manager")
-            .set_owned_chrome_process_for_test(spawn_sleeping_test_process());
+            .set_owned_chrome_process_for_test(spawn_sleeping_test_process(30));
 
         let cleanup = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
