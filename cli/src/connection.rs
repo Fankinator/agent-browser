@@ -153,6 +153,50 @@ fn get_config_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.config", session))
 }
 
+#[cfg(windows)]
+fn prepare_windows_daemon_stderr(
+    socket_dir: &std::path::Path,
+    session: &str,
+    debug: bool,
+) -> Result<(PathBuf, fs::File, fs::File), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const GENERIC_READ_WRITE_DELETE: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
+
+    let path = if debug {
+        socket_dir.join(format!("{}.log", session))
+    } else {
+        socket_dir.join(format!(
+            "{}.daemon-{}.stderr.log",
+            session,
+            uuid::Uuid::new_v4()
+        ))
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE);
+    if !debug {
+        options
+            .access_mode(GENERIC_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+
+    let writer = options
+        .open(&path)
+        .map_err(|error| format!("Failed to create daemon diagnostic file: {}", error))?;
+    let startup_reader = writer
+        .try_clone()
+        .map_err(|error| format!("Failed to retain daemon diagnostics: {}", error))?;
+    Ok((path, writer, startup_reader))
+}
+
 /// Clean up stale socket and PID files for a session
 pub fn cleanup_stale_files(session: &str) {
     let pid_path = get_pid_path(session);
@@ -860,6 +904,8 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     #[allow(unused_assignments)]
     let mut daemon_child: Option<std::process::Child> = None;
+    #[cfg(windows)]
+    let mut daemon_stderr_reader: Option<fs::File>;
 
     #[cfg(unix)]
     {
@@ -896,11 +942,18 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
 
+        // A detached Windows daemon cannot keep a pipe whose reader belongs to
+        // the short-lived spawning CLI. A file handle remains writable for the
+        // daemon lifetime, preserves startup diagnostics, and is automatically
+        // deleted on close unless --debug requested a persistent session log.
+        let (_diagnostic_path, daemon_stderr, startup_reader) =
+            prepare_windows_daemon_stderr(&socket_dir, session, opts.debug)?;
+        daemon_stderr_reader = Some(startup_reader);
         daemon_child = Some(
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::from(daemon_stderr))
                 .spawn()
                 .map_err(|e| format!("Failed to start daemon: {}", e))?,
         );
@@ -929,6 +982,13 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 let mut stderr_output = String::new();
                 if let Some(mut stderr) = child.stderr.take() {
                     let _ = stderr.read_to_string(&mut stderr_output);
+                }
+                #[cfg(windows)]
+                if let Some(reader) = daemon_stderr_reader.as_mut() {
+                    use std::io::{Seek, SeekFrom};
+
+                    let _ = reader.seek(SeekFrom::Start(0));
+                    let _ = reader.read_to_string(&mut stderr_output);
                 }
                 let stderr_trimmed = stderr_output.trim();
 
@@ -1117,6 +1177,68 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_diagnostics_outlive_the_spawning_reader_without_leaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut daemon_writer, startup_reader) =
+            prepare_windows_daemon_stderr(dir.path(), "diagnostic-test", false).unwrap();
+
+        drop(startup_reader);
+        writeln!(daemon_writer, "late daemon diagnostic").unwrap();
+        daemon_writer.flush().unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "late daemon diagnostic\n"
+        );
+
+        drop(daemon_writer);
+        assert!(
+            !path.exists(),
+            "non-debug diagnostics must be deleted when the daemon handle closes"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_reader_retains_early_daemon_exit_diagnostics() {
+        use std::io::{Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut daemon_writer, mut startup_reader) =
+            prepare_windows_daemon_stderr(dir.path(), "startup-test", false).unwrap();
+
+        writeln!(
+            daemon_writer,
+            "Failed to bind TCP: injected startup failure"
+        )
+        .unwrap();
+        daemon_writer.flush().unwrap();
+        drop(daemon_writer);
+
+        let mut diagnostics = String::new();
+        startup_reader.seek(SeekFrom::Start(0)).unwrap();
+        startup_reader.read_to_string(&mut diagnostics).unwrap();
+        assert!(diagnostics.contains("Failed to bind TCP"));
+        assert!(path.exists(), "the startup reader must retain the file");
+
+        drop(startup_reader);
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_debug_daemon_diagnostics_use_the_persistent_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, writer, reader) =
+            prepare_windows_daemon_stderr(dir.path(), "debug-test", true).unwrap();
+        assert_eq!(path, dir.path().join("debug-test.log"));
+
+        drop(reader);
+        drop(writer);
+        assert!(path.exists());
+    }
 
     #[test]
     fn test_get_socket_dir_explicit_override() {

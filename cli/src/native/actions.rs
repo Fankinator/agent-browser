@@ -60,6 +60,7 @@ const AUTH_LOGIN_SELECTOR_POLL_INTERVAL_MS: u64 = 100;
 const AUTH_LOGIN_PREFERRED_SELECTOR_WINDOW_MS: u64 = 5_000;
 const AUTO_ATTACHED_DIALOG_OBSERVATION_MS: u64 = 500;
 const AUTO_ATTACHED_TARGET_INIT_MS: u64 = 2_000;
+const AUTO_ATTACHED_TARGET_RECOVERY_MS: u64 = 500;
 
 pub struct PendingConfirmation {
     pub action: String,
@@ -734,31 +735,33 @@ impl DaemonState {
                             continue;
                         }
 
-                        let controls_result = if controls_active && target_needs_controls {
+                        let worker_target = target_info
+                            .as_ref()
+                            .filter(|target| target_is_worker_like(target));
+                        let controls_result = if let Some(target) = worker_target {
+                            prepare_auto_attached_worker_session(
+                                &client,
+                                &sid,
+                                target,
+                                df.as_ref(),
+                                has_proxy_creds,
+                                std::time::Duration::from_millis(AUTO_ATTACHED_TARGET_INIT_MS),
+                            )
+                            .await
+                        } else if controls_active && target_needs_controls {
                             async {
                                 if let Some(ref target) = target_info {
                                     prepare_network_control_target_session(&client, &sid, target)
                                         .await?;
                                 }
-                                if let Some(ref target) = target_info {
-                                    if target_is_worker_like(target) {
-                                        install_worker_network_controls_for_session(
-                                            &client,
-                                            &sid,
-                                            df.as_ref(),
-                                            has_proxy_creds,
-                                            target,
-                                        )
-                                        .await
-                                    } else {
-                                        install_network_controls_for_session(
-                                            &client,
-                                            &sid,
-                                            df.as_ref(),
-                                            has_proxy_creds,
-                                        )
-                                        .await
-                                    }
+                                if target_info.is_some() {
+                                    install_network_controls_for_session(
+                                        &client,
+                                        &sid,
+                                        df.as_ref(),
+                                        has_proxy_creds,
+                                    )
+                                    .await
                                 } else {
                                     Ok(())
                                 }
@@ -768,7 +771,7 @@ impl DaemonState {
                             Ok(())
                         };
 
-                        if controls_result.is_ok() {
+                        if controls_result.is_ok() && worker_target.is_none() {
                             let _ = client
                                 .send_command_no_wait(
                                     "Runtime.runIfWaitingForDebugger",
@@ -862,12 +865,7 @@ impl DaemonState {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if matches!(dialog_type, "beforeunload" | "alert") {
-                            let message = event
-                                .params
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            eprintln!("[auto-dismiss] {} dialog: {}", dialog_type, message);
+                            eprintln!("[auto-dismiss] {} dialog", dialog_type);
                             let sid = event.session_id.clone().unwrap_or_default();
                             if let Err(e) = client
                                 .send_command(
@@ -1122,29 +1120,14 @@ impl DaemonState {
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
             let controls_active = filter.is_some() || has_proxy_creds;
             let setup_result = if let Some(ref mgr) = self.browser {
-                async {
-                    prepare_network_control_target_session(&mgr.client, worker_sid, target_info)
-                        .await?;
-                    if controls_active {
-                        install_worker_network_controls_for_session(
-                            &mgr.client,
-                            worker_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                            target_info,
-                        )
-                        .await?;
-                    }
-                    let _ = mgr
-                        .client
-                        .send_command_no_wait(
-                            "Runtime.runIfWaitingForDebugger",
-                            None,
-                            Some(worker_sid),
-                        )
-                        .await;
-                    Ok(())
-                }
+                prepare_auto_attached_worker_session(
+                    &mgr.client,
+                    worker_sid,
+                    target_info,
+                    filter.as_ref(),
+                    has_proxy_creds,
+                    std::time::Duration::from_millis(AUTO_ATTACHED_TARGET_INIT_MS),
+                )
                 .await
             } else {
                 Ok(())
@@ -2056,6 +2039,19 @@ async fn close_active_provider_session(state: &mut DaemonState) {
 }
 
 pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+    close_current_browser_with_mode(state, false).await
+}
+
+async fn close_current_browser_after_control_failure(
+    state: &mut DaemonState,
+) -> Result<(), String> {
+    close_current_browser_with_mode(state, true).await
+}
+
+async fn close_current_browser_with_mode(
+    state: &mut DaemonState,
+    after_control_failure: bool,
+) -> Result<(), String> {
     if let Some(task) = state.fetch_handler_task.take() {
         task.abort();
     }
@@ -2065,7 +2061,11 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.event_rx = None;
 
     let close_error = if let Some(mut mgr) = state.browser.take() {
-        mgr.close().await.err()
+        if after_control_failure {
+            mgr.close_after_control_failure().await.err()
+        } else {
+            mgr.close().await.err()
+        }
     } else {
         None
     };
@@ -2090,7 +2090,9 @@ async fn close_after_network_control_failure(
     state: &mut DaemonState,
     error: String,
 ) -> Result<(), String> {
-    let close_error = close_current_browser(state).await.err();
+    let close_error = close_current_browser_after_control_failure(state)
+        .await
+        .err();
     Err(match close_error {
         Some(close_error) => format!(
             "Failed to install browser network controls: {} (also failed to close browser: {})",
@@ -3198,6 +3200,111 @@ async fn install_worker_network_controls_for_session(
     }
 
     Ok(())
+}
+
+async fn prepare_auto_attached_worker_session(
+    client: &CdpClient,
+    session_id: &str,
+    target: &TargetInfo,
+    filter: Option<&DomainFilter>,
+    handle_auth_requests: bool,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let preparation = tokio::time::timeout(timeout, async {
+        prepare_network_control_target_session(client, session_id, target).await?;
+        if network_controls_required(filter, handle_auth_requests) {
+            install_worker_network_controls_for_session(
+                client,
+                session_id,
+                filter,
+                handle_auth_requests,
+                target,
+            )
+            .await?;
+        }
+        client
+            .send_command_no_wait("Runtime.runIfWaitingForDebugger", None, Some(session_id))
+            .await
+    })
+    .await;
+
+    let error = match preparation {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => error,
+        Err(_) => format!(
+            "Timed out after {}ms preparing worker target {}",
+            timeout.as_millis(),
+            target.target_id
+        ),
+    };
+
+    let recovery_error = close_paused_non_page_target(
+        client,
+        session_id,
+        &target.target_id,
+        std::time::Duration::from_millis(AUTO_ATTACHED_TARGET_RECOVERY_MS),
+    )
+    .await
+    .err();
+    Err(match recovery_error {
+        Some(recovery_error) => format!(
+            "{} (also failed to release the paused worker target: {})",
+            error, recovery_error
+        ),
+        None => error,
+    })
+}
+
+async fn close_paused_non_page_target(
+    client: &CdpClient,
+    session_id: &str,
+    target_id: &str,
+    command_timeout: std::time::Duration,
+) -> Result<(), String> {
+    let close_error = match client
+        .send_command_with_timeout(
+            "Target.closeTarget",
+            Some(json!({ "targetId": target_id })),
+            None,
+            command_timeout,
+        )
+        .await
+    {
+        Ok(result) if result.get("success").and_then(Value::as_bool) == Some(true) => {
+            return Ok(());
+        }
+        Ok(_) => "Target.closeTarget was rejected".to_string(),
+        Err(error) => error,
+    };
+
+    let resume_error = client
+        .send_command_with_timeout(
+            "Runtime.runIfWaitingForDebugger",
+            None,
+            Some(session_id),
+            command_timeout,
+        )
+        .await
+        .err();
+    let detach_error = client
+        .send_command_with_timeout(
+            "Target.detachFromTarget",
+            Some(json!({ "sessionId": session_id })),
+            None,
+            command_timeout,
+        )
+        .await
+        .err();
+
+    match (resume_error, detach_error) {
+        (None, None) => Ok(()),
+        (resume_error, detach_error) => Err(format!(
+            "{}; fallback resume: {}; fallback detach: {}",
+            close_error,
+            resume_error.as_deref().unwrap_or("acknowledged"),
+            detach_error.as_deref().unwrap_or("acknowledged"),
+        )),
+    }
 }
 
 async fn install_active_network_controls(
@@ -13060,6 +13167,279 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(!network_controls_required(None, false));
         assert!(network_controls_required(Some(&filter), false));
         assert!(network_controls_required(None, true));
+    }
+
+    #[derive(Clone, Copy)]
+    enum WorkerCloseReply {
+        Rejected,
+        Timeout,
+    }
+
+    #[derive(Default)]
+    struct PausedWorkerProtocolState {
+        detached: bool,
+        paused: bool,
+        resumed: bool,
+    }
+
+    async fn state_with_paused_worker_protocol(
+        close_reply: WorkerCloseReply,
+        hold_browser_close: bool,
+    ) -> (
+        DaemonState,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (attach_tx, mut attach_rx) = tokio::sync::mpsc::unbounded_channel();
+        let recovered = Arc::new(tokio::sync::Notify::new());
+        let recovered_for_server = recovered.clone();
+        let protocol_state = Arc::new(tokio::sync::Mutex::new(PausedWorkerProtocolState {
+            paused: true,
+            ..PausedWorkerProtocolState::default()
+        }));
+        let protocol_state_for_server = protocol_state.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    attach = attach_rx.recv() => {
+                        if attach.is_none() {
+                            break;
+                        }
+                        websocket
+                            .send(Message::Text(
+                                json!({
+                                    "method": "Target.attachedToTarget",
+                                    "params": {
+                                        "sessionId": "worker-session",
+                                        "targetInfo": {
+                                            "targetId": "worker-target",
+                                            "type": "service_worker",
+                                            "title": "",
+                                            "url": "https://example.com/worker.js",
+                                            "attached": true,
+                                        },
+                                    },
+                                })
+                                .to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    message = websocket.next() => {
+                        let Some(Ok(Message::Text(text))) = message else {
+                            break;
+                        };
+                        let command: Value = serde_json::from_str(&text).unwrap();
+                        let id = command["id"].clone();
+                        let method = command["method"].as_str().unwrap();
+                        let mut result = Some(json!({}));
+                        let mut error = None;
+
+                        match method {
+                            "Target.getTargets" => {
+                                result = Some(json!({
+                                    "targetInfos": [{
+                                        "targetId": "page-target",
+                                        "type": "page",
+                                        "title": "",
+                                        "url": "about:blank",
+                                        "attached": false,
+                                    }],
+                                }));
+                            }
+                            "Target.attachToTarget" => {
+                                result = Some(json!({ "sessionId": "page-session" }));
+                            }
+                            "Fetch.enable" => {
+                                result = None;
+                                error = Some(json!({
+                                    "code": -32000,
+                                    "message": "injected worker control failure",
+                                }));
+                            }
+                            "Target.closeTarget" => {
+                                result = match close_reply {
+                                    WorkerCloseReply::Rejected => {
+                                        Some(json!({ "success": false }))
+                                    }
+                                    WorkerCloseReply::Timeout => None,
+                                };
+                            }
+                            "Browser.close" if hold_browser_close => {
+                                result = None;
+                            }
+                            "Runtime.runIfWaitingForDebugger"
+                                if command["sessionId"] == "worker-session" =>
+                            {
+                                let mut state = protocol_state_for_server.lock().await;
+                                state.paused = false;
+                                state.resumed = true;
+                            }
+                            "Target.detachFromTarget"
+                                if command["params"]["sessionId"] == "worker-session" =>
+                            {
+                                let mut state = protocol_state_for_server.lock().await;
+                                state.detached = true;
+                                if state.resumed && !state.paused {
+                                    recovered_for_server.notify_one();
+                                }
+                            }
+                            "Browser.getVersion" => {
+                                let state = protocol_state_for_server.lock().await;
+                                if state.paused || !state.detached {
+                                    result = None;
+                                } else {
+                                    result = Some(json!({ "product": "test-browser" }));
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        let response = match (result, error) {
+                            (Some(result), _) => Some(json!({ "id": id, "result": result })),
+                            (_, Some(error)) => Some(json!({ "id": id, "error": error })),
+                            (None, None) => None,
+                        };
+                        if let Some(response) = response {
+                            websocket
+                                .send(Message::Text(response.to_string()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+        });
+
+        let browser = BrowserManager::connect_cdp(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut state = DaemonState::new();
+        state.browser = Some(browser);
+        *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
+        state.subscribe_to_browser_events();
+        state.start_fetch_handler();
+
+        (state, attach_tx, recovered, server)
+    }
+
+    #[tokio::test]
+    async fn rejected_worker_close_resumes_and_detaches_before_following_commands() {
+        let (mut state, attach_tx, recovered, server) =
+            state_with_paused_worker_protocol(WorkerCloseReply::Rejected, false).await;
+
+        attach_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), recovered.notified())
+            .await
+            .expect("a rejected close must resume and detach the paused worker");
+
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state
+                .browser
+                .as_ref()
+                .unwrap()
+                .client
+                .send_command("Browser.getVersion", None, None),
+        )
+        .await
+        .expect("worker recovery must not hold the following command lane")
+        .expect("the following CDP command should succeed");
+        assert_eq!(version["product"], "test-browser");
+
+        close_current_browser(&mut state).await.unwrap();
+        drop(attach_tx);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_worker_close_resumes_and_detaches_before_following_commands() {
+        let (mut state, attach_tx, recovered, server) =
+            state_with_paused_worker_protocol(WorkerCloseReply::Timeout, false).await;
+
+        attach_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), recovered.notified())
+            .await
+            .expect("an unacknowledged close must resume and detach the paused worker");
+
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state
+                .browser
+                .as_ref()
+                .unwrap()
+                .client
+                .send_command("Browser.getVersion", None, None),
+        )
+        .await
+        .expect("worker timeout recovery must not hold the following command lane")
+        .expect("the following CDP command should succeed");
+        assert_eq!(version["product"], "test-browser");
+
+        close_current_browser(&mut state).await.unwrap();
+        drop(attach_tx);
+        server.await.unwrap();
+    }
+
+    fn spawn_sleeping_test_process() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 30",
+                ])
+                .spawn()
+                .expect("spawn sleeping test process")
+        }
+
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .expect("spawn sleeping test process")
+        }
+    }
+
+    #[tokio::test]
+    async fn network_control_failure_cleanup_is_short_bounded() {
+        let (mut state, attach_tx, _recovered, server) =
+            state_with_paused_worker_protocol(WorkerCloseReply::Rejected, true).await;
+        state
+            .browser
+            .as_mut()
+            .expect("browser manager")
+            .set_owned_chrome_process_for_test(spawn_sleeping_test_process());
+
+        let cleanup = tokio::time::timeout(
+            std::time::Duration::from_millis(1_500),
+            close_after_network_control_failure(
+                &mut state,
+                "simulated network-control failure".to_string(),
+            ),
+        )
+        .await;
+
+        drop(attach_tx);
+        server.abort();
+
+        assert!(
+            cleanup.is_ok(),
+            "network-control failure cleanup must not wait for the normal Browser.close timeout"
+        );
+        assert!(cleanup.expect("bounded cleanup").is_err());
+        assert!(state.browser.is_none());
     }
 
     #[test]

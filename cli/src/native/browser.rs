@@ -350,6 +350,13 @@ const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHROME_ATTACHED_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl BrowserManager {
+    #[cfg(test)]
+    pub(crate) fn set_owned_chrome_process_for_test(&mut self, child: std::process::Child) {
+        self.browser_process = Some(BrowserProcess::Chrome(ChromeProcess::from_child_for_test(
+            child,
+        )));
+    }
+
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
 
@@ -964,6 +971,28 @@ impl BrowserManager {
                 process.wait_or_kill(timeout);
             })
             .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn close_after_control_failure(&mut self) -> Result<(), String> {
+        const FAILURE_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+        if self.browser_process.is_some() {
+            let _ = self
+                .client
+                .send_command_with_timeout("Browser.close", None, None, FAILURE_CLOSE_TIMEOUT)
+                .await;
+        }
+
+        if let Some(mut process) = self.browser_process.take() {
+            let cleanup = tokio::task::spawn_blocking(move || {
+                process.wait_or_kill(FAILURE_CLOSE_TIMEOUT);
+            });
+            let _ =
+                tokio::time::timeout(FAILURE_CLOSE_TIMEOUT + Duration::from_millis(250), cleanup)
+                    .await;
         }
 
         Ok(())
