@@ -124,7 +124,12 @@ jobs:
           cache: pnpm
 
       - name: Install JavaScript dependencies
+        if: runner.os != 'Windows'
         run: pnpm install --frozen-lockfile
+
+      - name: Install JavaScript dependencies on Windows
+        if: runner.os == 'Windows'
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Sync version
         run: pnpm run version:sync
