@@ -56,6 +56,9 @@ jobs:
     needs: verify
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -89,9 +92,9 @@ jobs:
             binary: agent-browser-linux-musl-arm64
             use_zigbuild: true
           - name: Windows x64
-            os: ubuntu-latest
-            rust_target: x86_64-pc-windows-gnu
-            build_target: x86_64-pc-windows-gnu
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            build_target: x86_64-pc-windows-msvc
             source_binary: agent-browser.exe
             binary: agent-browser-win32-x64.exe
             use_zigbuild: false
@@ -133,29 +136,11 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install Linux cross-compilation tools
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu mingw-w64
-
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
         run: |
           pip3 install ziglang
           cargo install cargo-zigbuild --version 0.22.3 --locked
-
-      - name: Configure Rust linkers
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-
-          [target.x86_64-pc-windows-gnu]
-          linker = "x86_64-w64-mingw32-gcc"
-          EOF
 
       - uses: Swatinem/rust-cache@v2
         with:
