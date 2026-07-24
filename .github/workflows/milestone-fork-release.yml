@@ -3,19 +3,19 @@ name: Milestone Fork Release
 on:
   push:
     branches:
-      - release/v0.32.4-milestone.2
+      - release/v0.32.4-milestone.3
   workflow_dispatch:
 
 concurrency:
-  group: milestone-fork-release-v0.32.4-milestone.2
+  group: milestone-fork-release-v0.32.4-milestone.3
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  RELEASE_VERSION: 0.32.4-milestone.2
-  RELEASE_TAG: v0.32.4-milestone.2
+  RELEASE_VERSION: 0.32.4-milestone.3
+  RELEASE_TAG: v0.32.4-milestone.3
 
 jobs:
   verify:
@@ -252,7 +252,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TAG" \
-            --notes "Project-controlled backport of the immediate new-target dialog lifecycle fix and daemon sidecar cleanup. Based on upstream v0.32.4; see SOURCE-PROVENANCE.json and SHA256SUMS." \
+            --notes "Project-controlled hardening for the immediate new-target dialog lifecycle, bounded auto-attached worker recovery, and Windows daemon/process cleanup. Based on upstream v0.32.4; see SOURCE-PROVENANCE.json and SHA256SUMS." \
             release-assets/*
         env:
           GH_TOKEN: ${{ github.token }}
