@@ -99,7 +99,10 @@ jobs:
 
       - name: Verify upstream base
         run: |
-          test "$(git rev-parse "refs/tags/${UPSTREAM_BASE_TAG}^{commit}")" = "$UPSTREAM_BASE_COMMIT"
+          UPSTREAM_TAG_REF="refs/milestone-upstream-tags/${UPSTREAM_BASE_TAG}"
+          git fetch --no-tags https://github.com/vercel-labs/agent-browser.git \
+            "refs/tags/${UPSTREAM_BASE_TAG}:${UPSTREAM_TAG_REF}"
+          test "$(git rev-parse "${UPSTREAM_TAG_REF}^{commit}")" = "$UPSTREAM_BASE_COMMIT"
           git merge-base --is-ancestor "$UPSTREAM_BASE_COMMIT" "$GITHUB_SHA"
 
       - name: Format
