@@ -613,8 +613,10 @@ mod agentcore {
             live_view_url: live_view_url.clone(),
         });
 
-        eprintln!("Session: {}", session_id);
-        eprintln!("Live View: {}", live_view_url);
+        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+            eprintln!("Session: {}", session_id);
+            eprintln!("Live View: {}", live_view_url);
+        }
 
         let ws_path = format!(
             "/browser-streams/{}/sessions/{}/automation",

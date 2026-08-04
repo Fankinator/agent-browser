@@ -70,6 +70,13 @@ impl Drop for PendingGuard {
     }
 }
 
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        self._reader_handle.abort();
+        self._keepalive_handle.abort();
+    }
+}
+
 impl CdpClient {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
@@ -234,6 +241,22 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.send_command_with_timeout(
+            method,
+            params,
+            session_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub async fn send_command_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -262,13 +285,13 @@ impl CdpClient {
 
         {
             let mut ws_tx = self.ws_tx.lock().await;
-            ws_tx
-                .send(Message::Text(json))
-                .await
-                .map_err(|e| format!("Failed to send CDP command: {}", e))?;
+            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+                self.pending.lock().await.remove(&id);
+                return Err(format!("Failed to send CDP command: {}", error));
+            }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        let response = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => {
                 guard.done = true;
                 resp
@@ -280,7 +303,11 @@ impl CdpClient {
             Err(_) => {
                 guard.done = true;
                 self.pending.lock().await.remove(&id);
-                return Err(format!("CDP command timed out: {}", method));
+                return Err(format!(
+                    "CDP command timed out after {}ms: {}",
+                    timeout.as_millis(),
+                    method
+                ));
             }
         };
 

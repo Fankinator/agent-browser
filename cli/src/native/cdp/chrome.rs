@@ -19,6 +19,19 @@ pub struct ChromeProcess {
 }
 
 impl ChromeProcess {
+    #[cfg(test)]
+    pub(crate) fn from_child_for_test(child: Child) -> Self {
+        Self {
+            child,
+            ws_url: "ws://test.invalid/devtools/browser/test".to_string(),
+            temp_user_data_dir: None,
+            #[cfg(unix)]
+            pgid: None,
+            #[cfg(target_os = "linux")]
+            xvfb: None,
+        }
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         // On Unix, kill the entire process group to ensure Chrome helper

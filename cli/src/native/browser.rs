@@ -352,6 +352,8 @@ pub struct BrowserManager {
     pub download_path: Option<String>,
     /// Whether to ignore HTTPS certificate errors, re-applied to new contexts (e.g., recording)
     pub ignore_https_errors: bool,
+    launch_user_agent: Option<String>,
+    launch_color_scheme: Option<String>,
     /// Origins visited during this session, used by save_state to collect cross-origin localStorage.
     visited_origins: HashSet<String>,
     next_tab_id: u32,
@@ -362,11 +364,19 @@ pub struct BrowserManager {
     /// launch rules such as extension-forced headed mode. Meaningless for
     /// attached browsers (browser_process is None).
     headless: bool,
+    /// True after browser-level Target.setAutoAttach becomes the canonical
+    /// owner of new page sessions.
+    browser_auto_attach_enabled: bool,
 }
 
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+const CHROME_ATTACHED_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total budget for classifying attached Chrome renderers, observing dialogs,
+/// recovering a discarded renderer, and enabling the selected page.
+const CHROME_CDP_CONNECTION_BUDGET: Duration = Duration::from_secs(2);
+const CHROME_CDP_RENDERER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl BrowserManager {
     /// True when a *default* idle timeout must not close this browser:
@@ -378,6 +388,13 @@ impl BrowserManager {
     /// lifecycle. An explicit AGENT_BROWSER_IDLE_TIMEOUT_MS applies regardless.
     pub fn blocks_default_idle_shutdown(&self) -> bool {
         self.browser_process.is_none() || !self.headless
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_owned_chrome_process_for_test(&mut self, child: std::process::Child) {
+        self.browser_process = Some(BrowserProcess::Chrome(ChromeProcess::from_child_for_test(
+            child,
+        )));
     }
 
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
@@ -431,7 +448,7 @@ impl BrowserManager {
             }
         };
 
-        let manager = if engine == "lightpanda" {
+        let mut manager = if engine == "lightpanda" {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
@@ -444,49 +461,26 @@ impl BrowserManager {
                 default_timeout_ms: 25_000,
                 download_path: download_path.clone(),
                 ignore_https_errors,
+                launch_user_agent: user_agent.clone(),
+                launch_color_scheme: color_scheme.clone(),
                 visited_origins: HashSet::new(),
                 next_tab_id: 1,
                 direct_page: false,
                 headless,
+                browser_auto_attach_enabled: false,
             };
-            manager.discover_and_attach_targets().await?;
+            manager.discover_and_attach_targets(None).await?;
             manager
         };
+        manager.download_path = download_path.clone();
+        manager.ignore_https_errors = ignore_https_errors;
+        manager.launch_user_agent = user_agent;
+        manager.launch_color_scheme = color_scheme;
 
         let session_id = manager.active_session_id()?.to_string();
-
-        if ignore_https_errors {
-            let _ = manager
-                .client
-                .send_command(
-                    "Security.setIgnoreCertificateErrors",
-                    Some(json!({ "ignore": true })),
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        if let Some(ref ua) = user_agent {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setUserAgentOverride",
-                    Some(json!({ "userAgent": ua })),
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        if let Some(ref scheme) = color_scheme {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setEmulatedMedia",
-                    Some(json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme }] })),
-                    Some(&session_id),
-                )
-                .await;
-        }
+        let _ = manager
+            .apply_launch_session_configuration_pub(&session_id)
+            .await;
 
         if let Some(ref path) = download_path {
             let _ = manager
@@ -535,10 +529,13 @@ impl BrowserManager {
             default_timeout_ms: 25_000,
             download_path: None,
             ignore_https_errors: false,
+            launch_user_agent: None,
+            launch_color_scheme: None,
             visited_origins: HashSet::new(),
             next_tab_id: 1,
             direct_page,
             headless: true,
+            browser_auto_attach_enabled: false,
         };
 
         if direct_page {
@@ -555,7 +552,16 @@ impl BrowserManager {
             manager.active_page_index = 0;
             manager.enable_domains_direct().await?;
         } else {
-            manager.discover_and_attach_targets().await?;
+            let deadline = Instant::now() + CHROME_CDP_CONNECTION_BUDGET;
+            match tokio::time::timeout(
+                CHROME_CDP_CONNECTION_BUDGET,
+                manager.discover_and_attach_targets(Some(deadline)),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(chrome_cdp_connection_budget_error()),
+            }
         }
         Ok(manager)
     }
@@ -565,7 +571,10 @@ impl BrowserManager {
         Self::connect_cdp(&ws_url).await
     }
 
-    async fn discover_and_attach_targets(&mut self) -> Result<(), String> {
+    async fn discover_and_attach_targets(
+        &mut self,
+        connection_deadline: Option<Instant>,
+    ) -> Result<(), String> {
         self.client
             .send_command_typed::<_, Value>(
                 "Target.setDiscoverTargets",
@@ -622,7 +631,8 @@ impl BrowserManager {
                 target_type: "page".to_string(),
             });
             self.active_page_index = 0;
-            self.enable_domains(&attach_result.session_id).await?;
+            self.enable_initial_attached_page_domains(&attach_result.session_id)
+                .await?;
         } else {
             for target in &page_targets {
                 let attach_result: AttachToTargetResult = self
@@ -636,7 +646,6 @@ impl BrowserManager {
                         None,
                     )
                     .await?;
-
                 let tab_id = self.next_tab_id;
                 self.next_tab_id += 1;
                 self.pages.push(PageInfo {
@@ -659,25 +668,60 @@ impl BrowserManager {
             // bounded, so connect never rides the 30s renderer-command ceiling).
             let session_ids: Vec<String> =
                 self.pages.iter().map(|p| p.session_id.clone()).collect();
-            let active = match self.find_live_page_index(&session_ids).await {
-                Some(index) => index,
-                None => {
-                    // No live tab to fall back to: revive the first one. There
-                    // is no active dialog at connect time, so dialog_session is
-                    // None. The RendererState is discarded; we only need it to
-                    // not error (an unrevivable tab fails connect fast).
-                    let target_id = self.pages[0].target_id.clone();
-                    self.ensure_renderer_alive(&session_ids[0], &target_id, None)
-                        .await?;
-                    0
+            let active = if let Some(deadline) = connection_deadline {
+                match self.find_connect_page_index(&session_ids, deadline).await? {
+                    Some(index) => index,
+                    None => {
+                        let target_id = self.pages[0].target_id.clone();
+                        self.revive_renderer_for_connect(&session_ids[0], &target_id, deadline)
+                            .await?;
+                        0
+                    }
+                }
+            } else {
+                match self.find_live_page_index(&session_ids).await {
+                    Some(index) => index,
+                    None => {
+                        // A newly launched browser has no pre-existing dialog
+                        // to classify. Revive its first renderer when every
+                        // attached page is discarded.
+                        let target_id = self.pages[0].target_id.clone();
+                        self.ensure_renderer_alive(&session_ids[0], &target_id, None)
+                            .await?;
+                        0
+                    }
                 }
             };
             self.active_page_index = active;
             let session_id = self.pages[active].session_id.clone();
-            self.enable_domains(&session_id).await?;
+            if let Some(deadline) = connection_deadline {
+                let remaining = remaining_chrome_connection_budget(deadline)?;
+                match tokio::time::timeout(remaining, self.enable_domains(&session_id)).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(chrome_cdp_connection_budget_error()),
+                }
+            } else {
+                self.enable_initial_attached_page_domains(&session_id)
+                    .await?;
+            }
         }
 
         Ok(())
+    }
+
+    async fn enable_initial_attached_page_domains(&self, session_id: &str) -> Result<(), String> {
+        match tokio::time::timeout(
+            CHROME_ATTACHED_TARGET_INIT_TIMEOUT,
+            self.enable_domains(session_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Timed out after {}ms initializing an attached page. A pre-existing JavaScript dialog may be blocking it; resolve the dialog in Chrome and retry. The dialog was not accepted automatically.",
+                CHROME_ATTACHED_TARGET_INIT_TIMEOUT.as_millis(),
+            )),
+        }
     }
 
     pub async fn enable_domains_pub(&self, session_id: &str) -> Result<(), String> {
@@ -692,7 +736,46 @@ impl BrowserManager {
         self.resume_if_waiting(session_id).await
     }
 
-    pub async fn enable_browser_auto_attach_pub(&self) -> Result<(), String> {
+    pub async fn apply_launch_session_configuration_pub(
+        &self,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if self.ignore_https_errors {
+            self.client
+                .send_command(
+                    "Security.setIgnoreCertificateErrors",
+                    Some(json!({ "ignore": true })),
+                    Some(session_id),
+                )
+                .await?;
+        }
+        if let Some(ref user_agent) = self.launch_user_agent {
+            self.client
+                .send_command(
+                    "Emulation.setUserAgentOverride",
+                    Some(json!({ "userAgent": user_agent })),
+                    Some(session_id),
+                )
+                .await?;
+        }
+        if let Some(ref color_scheme) = self.launch_color_scheme {
+            self.client
+                .send_command(
+                    "Emulation.setEmulatedMedia",
+                    Some(json!({
+                        "features": [{
+                            "name": "prefers-color-scheme",
+                            "value": color_scheme,
+                        }]
+                    })),
+                    Some(session_id),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn enable_browser_auto_attach_pub(&mut self) -> Result<(), String> {
         self.client
             .send_command(
                 "Target.setAutoAttach",
@@ -704,6 +787,7 @@ impl BrowserManager {
                 None,
             )
             .await?;
+        self.browser_auto_attach_enabled = true;
         Ok(())
     }
 
@@ -759,6 +843,124 @@ impl BrowserManager {
         .is_ok()
     }
 
+    async fn navigation_history_responds(&self, session_id: &str, timeout: Duration) -> bool {
+        tokio::time::timeout(
+            timeout,
+            self.client
+                .send_command("Page.getNavigationHistory", None, Some(session_id)),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Classify every attached renderer inside the one connect budget. Page is
+    /// enabled without awaiting its response so newly reported dialogs can be
+    /// observed while renderer-bound probes run. Chrome does not replay a
+    /// pre-existing dialog event to a newly attached session, but the session's
+    /// browser-side navigation history still answers while its renderer is
+    /// paused. A discarded session answers neither probe.
+    async fn find_connect_page_index(
+        &self,
+        session_ids: &[String],
+        deadline: Instant,
+    ) -> Result<Option<usize>, String> {
+        let mut events = self.client.subscribe();
+        for session_id in session_ids {
+            let remaining = remaining_chrome_connection_budget(deadline)?;
+            match tokio::time::timeout(
+                remaining,
+                self.client
+                    .send_command_no_wait("Page.enable", None, Some(session_id)),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(chrome_cdp_connection_budget_error()),
+            }
+        }
+
+        let probe_timeout =
+            remaining_chrome_connection_budget(deadline)?.min(CHROME_CDP_RENDERER_PROBE_TIMEOUT);
+        let probes =
+            futures_util::future::join_all(session_ids.iter().map(|session_id| async move {
+                tokio::join!(
+                    self.renderer_responds(session_id, probe_timeout.as_millis() as u64),
+                    self.navigation_history_responds(session_id, probe_timeout),
+                )
+            }));
+        tokio::pin!(probes);
+
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    match event {
+                        Ok(event) if event.method == "Page.javascriptDialogOpening"
+                            && event.session_id.as_ref().is_none_or(|session_id| session_ids.contains(session_id)) =>
+                        {
+                            return Err(preexisting_dialog_connection_error());
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err("CDP event stream closed while classifying attached pages".to_string());
+                        }
+                    }
+                }
+                classifications = &mut probes => {
+                    if classifications
+                        .iter()
+                        .any(|(renderer_responded, history_responded)| !renderer_responded && *history_responded)
+                    {
+                        return Err(preexisting_dialog_connection_error());
+                    }
+                    return Ok(classifications
+                        .into_iter()
+                        .position(|(renderer_responded, _)| renderer_responded));
+                }
+            }
+        }
+    }
+
+    async fn revive_renderer_for_connect(
+        &self,
+        session_id: &str,
+        target_id: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let remaining = remaining_chrome_connection_budget(deadline)?;
+        match tokio::time::timeout(
+            remaining,
+            self.client.send_command(
+                "Target.activateTarget",
+                Some(json!({ "targetId": target_id })),
+                None,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "tab is not responding and Target.activateTarget failed: {error}"
+                ));
+            }
+            Err(_) => return Err(chrome_cdp_connection_budget_error()),
+        }
+
+        let remaining = remaining_chrome_connection_budget(deadline)?;
+        if self
+            .renderer_responds(session_id, remaining.as_millis() as u64)
+            .await
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "tab is not responding and did not recover within the {}ms connection budget",
+                CHROME_CDP_CONNECTION_BUDGET.as_millis()
+            ))
+        }
+    }
+
     /// Ensure the tab's renderer can serve commands. A non-responsive renderer
     /// is reactivated with Target.activateTarget, which reloads a genuinely
     /// discarded tab but only focuses a live one, so a probe false positive
@@ -769,7 +971,7 @@ impl BrowserManager {
         &self,
         session_id: &str,
         target_id: &str,
-        dialog_session: Option<&str>,
+        dialog_sessions: Option<&HashSet<String>>,
     ) -> Result<RendererState, String> {
         if self
             .renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
@@ -779,7 +981,7 @@ impl BrowserManager {
         }
         // A tab blocked by a JavaScript dialog is alive; its main thread is
         // paused, so the probe times out without the tab being discarded.
-        if dialog_session == Some(session_id) {
+        if dialog_sessions.is_some_and(|sessions| sessions.contains(session_id)) {
             return Ok(RendererState::DialogBlocked);
         }
         match tokio::time::timeout(
@@ -1094,6 +1296,28 @@ impl BrowserManager {
         Ok(())
     }
 
+    pub async fn close_after_control_failure(&mut self) -> Result<(), String> {
+        const FAILURE_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+        if self.browser_process.is_some() {
+            let _ = self
+                .client
+                .send_command_with_timeout("Browser.close", None, None, FAILURE_CLOSE_TIMEOUT)
+                .await;
+        }
+
+        if let Some(mut process) = self.browser_process.take() {
+            let cleanup = tokio::task::spawn_blocking(move || {
+                process.wait_or_kill(FAILURE_CLOSE_TIMEOUT);
+            });
+            let _ =
+                tokio::time::timeout(FAILURE_CLOSE_TIMEOUT + Duration::from_millis(250), cleanup)
+                    .await;
+        }
+
+        Ok(())
+    }
+
     pub fn has_pages(&self) -> bool {
         !self.pages.is_empty()
     }
@@ -1130,6 +1354,79 @@ impl BrowserManager {
         }
     }
 
+    pub async fn create_target_session(
+        &self,
+        params: Value,
+    ) -> Result<(CreateTargetResult, String, bool), String> {
+        let mut events = self.client.subscribe();
+        let target: CreateTargetResult = self
+            .client
+            .send_command_typed("Target.createTarget", &params, None)
+            .await?;
+
+        if self.browser_auto_attach_enabled {
+            let target_id = target.target_id.clone();
+            let attached_session = async {
+                loop {
+                    match events.recv().await {
+                        Ok(event) if event.method == "Target.attachedToTarget" => {
+                            let matches_target = event.params["targetInfo"]["targetId"].as_str()
+                                == Some(target_id.as_str());
+                            if matches_target {
+                                if let Some(session_id) =
+                                    event.params["sessionId"].as_str().map(ToString::to_string)
+                                {
+                                    return Ok(session_id);
+                                }
+                            }
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(
+                                "CDP event stream closed while waiting for the new page target"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            };
+
+            return match tokio::time::timeout(CHROME_ATTACHED_TARGET_INIT_TIMEOUT, attached_session)
+                .await
+            {
+                Ok(Ok(session_id)) => Ok((target, session_id, true)),
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let _ = self
+                        .client
+                        .send_command_no_wait(
+                            "Target.closeTarget",
+                            Some(json!({ "targetId": target.target_id })),
+                            None,
+                        )
+                        .await;
+                    Err(format!(
+                        "Timed out after {}ms waiting for the auto-attached page target; the target was closed so later commands can continue",
+                        CHROME_ATTACHED_TARGET_INIT_TIMEOUT.as_millis(),
+                    ))
+                }
+            };
+        }
+
+        let attach: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: target.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        Ok((target, attach.session_id, false))
+    }
+
     pub fn get_cdp_url(&self) -> &str {
         &self.ws_url
     }
@@ -1161,50 +1458,36 @@ impl BrowserManager {
     }
 
     /// Ensures the browser has at least one page. If `pages` is empty, creates a new
-    /// about:blank page and attaches to it.
-    pub async fn ensure_page(&mut self) -> Result<(), String> {
+    /// about:blank page and attaches to it. Returns the auto-attached session, when
+    /// applicable, so the command lane can wait for background initialization.
+    pub async fn ensure_page(&mut self) -> Result<Option<(String, String)>, String> {
         if !self.pages.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: "about:blank".to_string(),
-                },
-                None,
-            )
-            .await?;
-
-        let attach_result: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
+        let (result, session_id, auto_attached) = self
+            .create_target_session(json!({ "url": "about:blank" }))
             .await?;
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
+        let target_id = result.target_id;
         self.pages.push(PageInfo {
             tab_id,
             label: None,
-            target_id: result.target_id,
-            session_id: attach_result.session_id.clone(),
+            target_id: target_id.clone(),
+            session_id: session_id.clone(),
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
         });
         self.active_page_index = 0;
-        self.enable_domains(&attach_result.session_id).await?;
+        if !auto_attached {
+            self.enable_initial_attached_page_domains(&session_id)
+                .await?;
+        }
 
-        Ok(())
+        Ok(auto_attached.then_some((session_id, target_id)))
     }
 
     // -----------------------------------------------------------------------
@@ -1305,30 +1588,14 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                },
-                None,
-            )
+        let (result, session_id, auto_attached) = self
+            .create_target_session(json!({ "url": target_url }))
             .await?;
 
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        self.enable_domains(&attach.session_id).await?;
+        if !auto_attached {
+            self.enable_initial_attached_page_domains(&session_id)
+                .await?;
+        }
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -1338,7 +1605,7 @@ impl BrowserManager {
             tab_id,
             label: label.clone(),
             target_id: result.target_id,
-            session_id: attach.session_id,
+            session_id,
             url: target_url.to_string(),
             title: String::new(),
             target_type: "page".to_string(),
@@ -1356,7 +1623,7 @@ impl BrowserManager {
     pub async fn tab_switch(
         &mut self,
         index: usize,
-        dialog_session: Option<&str>,
+        dialog_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         if index >= self.pages.len() {
             return Err(format!(
@@ -1371,7 +1638,7 @@ impl BrowserManager {
         // A discarded tab has no renderer to answer Page.enable, so revive it
         // first and commit the switch only once it is usable.
         let renderer_state = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(&session_id, &target_id, dialog_sessions)
             .await
             .map_err(|e| {
                 format!(
@@ -1380,7 +1647,8 @@ impl BrowserManager {
                     e
                 )
             })?;
-        self.enable_domains(&session_id).await?;
+        self.enable_initial_attached_page_domains(&session_id)
+            .await?;
         self.active_page_index = index;
 
         // Bring tab to front
@@ -1430,7 +1698,7 @@ impl BrowserManager {
     pub async fn tab_close(
         &mut self,
         index: Option<usize>,
-        dialog_session: Option<&str>,
+        dialog_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let target_index = index.unwrap_or(self.active_page_index);
 
@@ -1470,7 +1738,7 @@ impl BrowserManager {
         let session_id = self.pages[self.active_page_index].session_id.clone();
         let target_id = self.pages[self.active_page_index].target_id.clone();
         if let Ok(state) = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(&session_id, &target_id, dialog_sessions)
             .await
         {
             // Best-effort: enabling domains on the successor must not turn the
@@ -1648,8 +1916,12 @@ impl BrowserManager {
         &self,
         accept: bool,
         prompt_text: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => self.active_session_id()?,
+        };
         let mut params = json!({ "accept": accept });
         if let Some(text) = prompt_text {
             params["promptText"] = Value::String(text.to_string());
@@ -1738,20 +2010,20 @@ impl BrowserManager {
     pub async fn tab_switch_by_id(
         &mut self,
         tab_id: u32,
-        dialog_session: Option<&str>,
+        dialog_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let index = self
             .pages
             .iter()
             .position(|p| p.tab_id == tab_id)
             .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
-        self.tab_switch(index, dialog_session).await
+        self.tab_switch(index, dialog_sessions).await
     }
 
     pub async fn tab_close_by_id(
         &mut self,
         tab_id: Option<u32>,
-        dialog_session: Option<&str>,
+        dialog_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let index = match tab_id {
             Some(id) => Some(
@@ -1762,7 +2034,7 @@ impl BrowserManager {
             ),
             None => None,
         };
-        self.tab_close(index, dialog_session).await
+        self.tab_close(index, dialog_sessions).await
     }
 
     pub fn assign_tab_id(&mut self) -> u32 {
@@ -1779,6 +2051,29 @@ impl BrowserManager {
 
     pub fn update_page_target_info(&mut self, target: &TargetInfo) -> bool {
         update_page_target_info_in_pages(&mut self.pages, target)
+    }
+
+    /// Makes a browser-auto-attached session canonical for an already tracked page.
+    /// Returns the superseded session so the caller can detach it.
+    pub fn replace_page_session(
+        &mut self,
+        target: &TargetInfo,
+        session_id: &str,
+    ) -> Option<String> {
+        let page = self
+            .pages
+            .iter_mut()
+            .find(|page| page.target_id == target.target_id)?;
+        page.url = target.url.clone();
+        page.title = target.title.clone();
+        page.target_type = target.target_type.clone();
+        if page.session_id == session_id {
+            return None;
+        }
+        Some(std::mem::replace(
+            &mut page.session_id,
+            session_id.to_string(),
+        ))
     }
 
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
@@ -1960,10 +2255,13 @@ async fn initialize_lightpanda_manager(
             default_timeout_ms: 25_000,
             download_path: None,
             ignore_https_errors: false,
+            launch_user_agent: None,
+            launch_color_scheme: None,
             visited_origins: HashSet::new(),
             next_tab_id: 1,
             direct_page: false,
             headless: true,
+            browser_auto_attach_enabled: false,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -1987,7 +2285,7 @@ async fn discover_and_attach_lightpanda_targets(
 ) -> Result<(), String> {
     run_with_lightpanda_deadline(
         deadline,
-        manager.discover_and_attach_targets(),
+        manager.discover_and_attach_targets(None),
         "Target domain initialization attempt exceeded the remaining startup deadline",
     )
     .await
@@ -1995,6 +2293,24 @@ async fn discover_and_attach_lightpanda_targets(
 
 fn remaining_until(deadline: Instant) -> Option<Duration> {
     deadline.checked_duration_since(Instant::now())
+}
+
+fn remaining_chrome_connection_budget(deadline: Instant) -> Result<Duration, String> {
+    remaining_until(deadline).ok_or_else(chrome_cdp_connection_budget_error)
+}
+
+fn chrome_cdp_connection_budget_error() -> String {
+    format!(
+        "Timed out after {}ms classifying and initializing attached Chrome pages",
+        CHROME_CDP_CONNECTION_BUDGET.as_millis()
+    )
+}
+
+fn preexisting_dialog_connection_error() -> String {
+    format!(
+        "Timed out within the {}ms connection budget initializing an attached page. A pre-existing JavaScript dialog is blocking it; resolve the dialog in Chrome and retry. The dialog was not accepted automatically.",
+        CHROME_CDP_CONNECTION_BUDGET.as_millis()
+    )
 }
 
 async fn run_with_lightpanda_deadline<F, T>(
@@ -2879,9 +3195,9 @@ mod tests {
         );
     }
 
-    /// Mock CDP endpoint whose second tab is alive but blocked by a JavaScript
-    /// dialog: it never answers Runtime.evaluate (its main thread is paused)
-    /// but still answers domain-enable and other browser-served commands.
+    /// Mock CDP endpoint whose second and third tabs become blocked by separate
+    /// JavaScript dialogs after connect: they stop answering Runtime.evaluate
+    /// but still answer domain-enable and other browser-served commands.
     /// Returns a counter of Target.activateTarget calls so a test can assert a
     /// blocked tab is treated as live without reactivation.
     async fn start_mock_cdp_browser_with_dialog_blocked_tab(
@@ -2904,6 +3220,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let (mut tx, mut rx) = ws.split();
+            let mut blocked_tab_evaluations = HashMap::<String, usize>::new();
 
             while let Some(Ok(msg)) = rx.next().await {
                 let text = match msg {
@@ -2934,17 +3251,33 @@ mod tests {
                         "targetInfos": [
                             { "targetId": "T-ALIVE", "type": "page", "title": "alive",
                               "url": "https://alive.test/", "attached": false },
-                            { "targetId": "T-BLOCKED", "type": "page", "title": "blocked",
-                              "url": "https://blocked.test/", "attached": false },
+                            { "targetId": "T-BLOCKED-SECOND", "type": "page", "title": "blocked-second",
+                              "url": "https://blocked-second.test/", "attached": false },
+                            { "targetId": "T-BLOCKED-FIRST", "type": "page", "title": "blocked-first",
+                              "url": "https://blocked-first.test/", "attached": false },
                         ]
                     }))),
                     "Target.attachToTarget" => {
                         let target = cmd["params"]["targetId"].as_str().unwrap_or("");
                         Some(respond(json!({ "sessionId": format!("S-{}", target) })))
                     }
-                    // The blocked tab's main thread is paused, so evaluation
-                    // never answers, but the tab is alive: everything else does.
-                    "Runtime.evaluate" if session == "S-T-BLOCKED" => None,
+                    // The tab is responsive during connect, then a dialog opens
+                    // before the switch and pauses its main thread. Everything
+                    // except later evaluation remains browser-served.
+                    "Runtime.evaluate" if session.starts_with("S-T-BLOCKED-") => {
+                        let evaluations = blocked_tab_evaluations
+                            .entry(session.to_string())
+                            .or_default();
+                        *evaluations += 1;
+                        (*evaluations == 1).then(|| {
+                            respond(json!({
+                                "result": {
+                                    "type": "string",
+                                    "value": "https://blocked.test/"
+                                }
+                            }))
+                        })
+                    }
                     "Runtime.evaluate" => Some(respond(
                         json!({ "result": { "type": "string", "value": "https://alive.test/" } }),
                     )),
@@ -2967,11 +3300,11 @@ mod tests {
     async fn test_tab_switch_does_not_misclassify_dialog_blocked_tab() {
         let (url, activations) = start_mock_cdp_browser_with_dialog_blocked_tab().await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
-        assert_eq!(mgr.pages.len(), 2);
+        assert_eq!(mgr.pages.len(), 3);
 
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            mgr.tab_switch(1, Some("S-T-BLOCKED")),
+            mgr.tab_switch(1, Some(&HashSet::from(["S-T-BLOCKED-SECOND".to_string()]))),
         )
         .await
         .expect("tab_switch must not hang on a dialog-blocked tab")
@@ -2992,6 +3325,61 @@ mod tests {
             "a dialog-blocked live tab must not be reactivated"
         );
         assert_eq!(mgr.active_page_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tab_switch_recognizes_nonfirst_known_dialog_session() {
+        let (url, activations) = start_mock_cdp_browser_with_dialog_blocked_tab().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.tab_switch(
+                1,
+                Some(&HashSet::from([
+                    "S-T-BLOCKED-FIRST".to_string(),
+                    "S-T-BLOCKED-SECOND".to_string(),
+                ])),
+            ),
+        )
+        .await
+        .expect("switching to another known dialog session must stay bounded")
+        .expect("the non-first known dialog session should remain switchable");
+
+        assert_eq!(result["dialogBlocked"], json!(true));
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a known dialog-blocked target must not be activated as discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tab_close_recognizes_nonfirst_known_dialog_successor() {
+        let (url, activations) = start_mock_cdp_browser_with_dialog_blocked_tab().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.tab_close(
+                Some(0),
+                Some(&HashSet::from([
+                    "S-T-BLOCKED-FIRST".to_string(),
+                    "S-T-BLOCKED-SECOND".to_string(),
+                ])),
+            ),
+        )
+        .await
+        .expect("closing onto another known dialog session must stay bounded")
+        .expect("the committed close should succeed with a dialog-blocked successor");
+
+        assert_eq!(result["closed"], json!(true));
+        assert!(result.get("activeTabRevived").is_none());
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a known dialog-blocked successor must not be activated as discarded"
+        );
     }
 
     /// Closing the active tab must not hang when the tab that becomes active is
@@ -3057,6 +3445,7 @@ mod tests {
     async fn start_mock_cdp_connect(
         targets: Vec<(&'static str, bool)>,
         revive_on_activate: bool,
+        dialog_targets: Vec<&'static str>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use futures_util::{SinkExt, StreamExt};
         use std::collections::HashSet;
@@ -3089,6 +3478,10 @@ mod tests {
             .iter()
             .filter(|(_, alive)| *alive)
             .map(|(id, _)| format!("S-{}", id))
+            .collect();
+        let dialog_sessions: HashSet<String> = dialog_targets
+            .into_iter()
+            .map(|id| format!("S-{}", id))
             .collect();
 
         tokio::spawn(async move {
@@ -3132,6 +3525,9 @@ mod tests {
                         }
                         Some(respond(json!({})))
                     }
+                    "Page.getNavigationHistory" if dialog_sessions.contains(&session) => {
+                        Some(respond(json!({ "currentIndex": 0, "entries": [] })))
+                    }
                     // A discarded session (not alive, not yet revived) never
                     // answers any renderer-bound command.
                     _ if !session.is_empty()
@@ -3162,7 +3558,8 @@ mod tests {
     #[tokio::test]
     async fn test_connect_skips_discarded_first_target() {
         let (url, activations) =
-            start_mock_cdp_connect(vec![("DISCARDED", false), ("ALIVE", true)], false).await;
+            start_mock_cdp_connect(vec![("DISCARDED", false), ("ALIVE", true)], false, vec![])
+                .await;
 
         let mgr = tokio::time::timeout(Duration::from_secs(15), BrowserManager::connect_cdp(&url))
             .await
@@ -3193,7 +3590,7 @@ mod tests {
             "t24", "t25", "t26", "t27", "t28", "t29",
         ];
         let targets: Vec<(&'static str, bool)> = ids.iter().map(|id| (*id, true)).collect();
-        let (url, activations) = start_mock_cdp_connect(targets, false).await;
+        let (url, activations) = start_mock_cdp_connect(targets, false, vec![]).await;
 
         let mgr = tokio::time::timeout(Duration::from_secs(5), BrowserManager::connect_cdp(&url))
             .await
@@ -3217,7 +3614,7 @@ mod tests {
     /// bounded) rather than hang, and succeed (#1036).
     #[tokio::test]
     async fn test_connect_all_discarded_revives_first_tab() {
-        let (url, activations) = start_mock_cdp_connect(vec![("ONLY", false)], true).await;
+        let (url, activations) = start_mock_cdp_connect(vec![("ONLY", false)], true, vec![]).await;
 
         let mgr = tokio::time::timeout(Duration::from_secs(20), BrowserManager::connect_cdp(&url))
             .await
@@ -3235,7 +3632,8 @@ mod tests {
     /// with a clear error instead of hanging (#1036).
     #[tokio::test]
     async fn test_connect_all_discarded_unrevivable_fails_fast() {
-        let (url, _activations) = start_mock_cdp_connect(vec![("ONLY", false)], false).await;
+        let (url, _activations) =
+            start_mock_cdp_connect(vec![("ONLY", false)], false, vec![]).await;
 
         let result =
             tokio::time::timeout(Duration::from_secs(30), BrowserManager::connect_cdp(&url))
@@ -3261,6 +3659,7 @@ mod tests {
         let (url, _activations) = start_mock_cdp_connect(
             vec![("DEAD1", false), ("DEAD2", false), ("ALIVE", true)],
             false,
+            vec![],
         )
         .await;
 
@@ -3279,6 +3678,34 @@ mod tests {
             mgr.client.pending_len().await,
             0,
             "cancelled connect-time probes left orphaned CDP requests in the pending map"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_refuses_preexisting_dialog_within_total_budget() {
+        let (url, activations) =
+            start_mock_cdp_connect(vec![("DIALOG", false)], false, vec!["DIALOG"]).await;
+
+        let attach =
+            tokio::time::timeout(Duration::from_secs(3), BrowserManager::connect_cdp(&url))
+                .await
+                .expect(
+                    "pre-existing dialog classification must stay within the connection budget",
+                );
+        let result = match attach {
+            Ok(_) => panic!("a pre-existing dialog must not be accepted automatically"),
+            Err(error) => error,
+        };
+
+        assert!(
+            result.contains("pre-existing JavaScript dialog")
+                && result.contains("not accepted automatically"),
+            "attach failure should be actionable and state the safety policy: {result}"
+        );
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a dialog-blocked renderer must not be treated as discarded and activated"
         );
     }
 }
