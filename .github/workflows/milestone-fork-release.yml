@@ -70,6 +70,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Test release workflow contract
+        run: node --test .github/tests/milestone-fork-release-workflow.test.mjs
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -508,14 +511,22 @@ jobs:
       - name: Create immutable tag and release
         run: |
           set -euo pipefail
-          CREATED_TAG_SHA=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/$RELEASE_TAG" \
-            -f sha="$GITHUB_SHA" \
-            --jq '.object.sha')
-          test "$CREATED_TAG_SHA" = "$GITHUB_SHA"
+          if REMOTE_TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null); then
+            if [ "$REMOTE_TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "Refusing publication because existing tag $RELEASE_TAG points to $REMOTE_TAG_SHA instead of $GITHUB_SHA"
+              exit 1
+            fi
+          else
+            CREATED_TAG_SHA=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" \
+              --jq '.object.sha')
+            test "$CREATED_TAG_SHA" = "$GITHUB_SHA"
+          fi
           REMOTE_TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')
           test "$REMOTE_TAG_SHA" = "$GITHUB_SHA"
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$RELEASE_TAG" \
             --notes "Project-controlled compatibility release preserving Milestone's bounded dialog safety, flat auto-attach and canonical sessions, worker lifecycle, and Windows daemon/process cleanup while retaining upstream discarded-tab recovery and stream fixes. Based on upstream $UPSTREAM_BASE_TAG at $UPSTREAM_BASE_COMMIT; see SOURCE-PROVENANCE.json and SHA256SUMS." \
