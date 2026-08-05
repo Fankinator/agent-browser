@@ -45,6 +45,38 @@ pub struct CdpClient {
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
 
+/// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
+/// outer timeout on the liveness probe), so a command whose response never
+/// comes can't leak until the connection closes (#1528). Normal exits disarm
+/// it via `done`.
+struct PendingGuard {
+    pending: PendingMap,
+    id: u64,
+    done: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let pending = self.pending.clone();
+        let id = self.id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        self._reader_handle.abort();
+        self._keepalive_handle.abort();
+    }
+}
+
 impl CdpClient {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
@@ -209,6 +241,22 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.send_command_with_timeout(
+            method,
+            params,
+            session_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub async fn send_command_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -228,20 +276,38 @@ impl CdpClient {
             pending.insert(id, tx);
         }
 
+        // Cleans up the pending entry if this future is cancelled mid-await (#1528).
+        let mut guard = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+            done: false,
+        };
+
         {
             let mut ws_tx = self.ws_tx.lock().await;
-            ws_tx
-                .send(Message::Text(json))
-                .await
-                .map_err(|e| format!("Failed to send CDP command: {}", e))?;
+            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+                self.pending.lock().await.remove(&id);
+                return Err(format!("Failed to send CDP command: {}", error));
+            }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => return Err("CDP response channel closed".to_string()),
+        let response = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => {
+                guard.done = true;
+                resp
+            }
+            Ok(Err(_)) => {
+                guard.done = true;
+                return Err("CDP response channel closed".to_string());
+            }
             Err(_) => {
+                guard.done = true;
                 self.pending.lock().await.remove(&id);
-                return Err(format!("CDP command timed out: {}", method));
+                return Err(format!(
+                    "CDP command timed out after {}ms: {}",
+                    timeout.as_millis(),
+                    method
+                ));
             }
         };
 
@@ -331,6 +397,13 @@ impl CdpClient {
             .send(Message::Text(json))
             .await
             .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+    }
+
+    /// Test-only: count of in-flight commands still awaiting a response, so a
+    /// test can assert a cancelled command left no orphaned entry (#1528).
+    #[cfg(test)]
+    pub(crate) async fn pending_len(&self) -> usize {
+        self.pending.lock().await.len()
     }
 }
 

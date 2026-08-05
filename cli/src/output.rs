@@ -709,18 +709,27 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         // Tab switch
         if action == Some("tab_switch") {
             if let Some(tab_id) = data.get("tabId").and_then(|v| v.as_str()) {
+                let note = if data.get("revived").and_then(|v| v.as_bool()) == Some(true) {
+                    " (revived, page may have reloaded)"
+                } else if data.get("dialogBlocked").and_then(|v| v.as_bool()) == Some(true) {
+                    " (dialog open, resolve it with `dialog accept`/`dialog dismiss`)"
+                } else {
+                    ""
+                };
                 if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
                     println!(
-                        "{} Switched to tab [{}] ({})",
+                        "{} Switched to tab [{}] ({}){}",
                         color::success_indicator(),
                         tab_id,
-                        url
+                        url,
+                        note
                     );
                 } else {
                     println!(
-                        "{} Switched to tab [{}]",
+                        "{} Switched to tab [{}]{}",
                         color::success_indicator(),
-                        tab_id
+                        tab_id,
+                        note
                     );
                 }
                 return;
@@ -897,7 +906,19 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             let label = match action {
                 Some("tab_close") => {
                     if let Some(closed_id) = data.get("tabId").and_then(|v| v.as_str()) {
-                        println!("{} Tab [{}] closed", color::success_indicator(), closed_id);
+                        let note = if data.get("activeTabRevived").and_then(|v| v.as_bool())
+                            == Some(true)
+                        {
+                            " (active tab revived, page may have reloaded)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "{} Tab [{}] closed{}",
+                            color::success_indicator(),
+                            closed_id,
+                            note
+                        );
                         return;
                     }
                     "Tab closed"
@@ -3011,6 +3032,19 @@ available localhost port automatically and reports it back.
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
+  - Frames are delivered latest-first: the newest frame is picked at send
+    time, so frames produced during an in-flight write are skipped, never
+    queued. Input events dispatch immediately, independent of frame
+    delivery, and are sent without waiting for the browser's reply, so a
+    click stays responsive behind a burst of mouse moves.
+  - Clients can cap their own frame rate by sending
+    {"type":"config","maxFps":N} (1-120, 0 = uncapped, per client).
+  - Clients that send {"type":"config","pacing":"ack"} receive one frame at
+    a time and acknowledge it with {"type":"ack","seq":N}, so a client that
+    stalls never drains a backlog of stale frames. Default is "push", where
+    frames already handed to the transport are delivered in order.
+  - Both settings can be declared on the URL instead, which is the only way
+    to cover the opening frame: ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
@@ -3694,6 +3728,8 @@ Options:
   --confirm-actions <list>   Categories requiring confirmation (or AGENT_BROWSER_CONFIRM_ACTIONS)
   --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or AGENT_BROWSER_CONFIRM_INTERACTIVE)
   --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
+  --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
+                             (default: 1h; 0 disables; dashboard input resets the timer)
   --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
@@ -3760,7 +3796,12 @@ Environment:
   AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
   AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
   AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
-  AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (disabled by default)
+  AGENT_BROWSER_STREAM_QUALITY   JPEG quality 0-100 (default: 80)
+  AGENT_BROWSER_STREAM_MAX_WIDTH  Cap frame width in pixels (default: the viewport)
+  AGENT_BROWSER_STREAM_MAX_HEIGHT Cap frame height in pixels (default: the viewport)
+  AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (default: 3600000 = 1h; 0 disables)
+                                 Dashboard input resets the timer; headed, Safari/iOS WebDriver, and user-attached browsers are exempt from the default
+                                 Provider-owned cloud browsers remain eligible for default cleanup
   AGENT_BROWSER_IOS_DEVICE       Default iOS device name
   AGENT_BROWSER_IOS_UDID         Default iOS device UDID
   AGENT_BROWSER_CONTENT_BOUNDARIES Wrap page output in boundary markers

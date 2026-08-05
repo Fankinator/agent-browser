@@ -14,6 +14,7 @@ permissions:
 jobs:
   check-release:
     name: Check for new version
+    if: github.repository == 'vercel-labs/agent-browser'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -90,7 +91,9 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.name }}
     needs: check-release
-    if: needs.check-release.outputs.should_release == 'true' || needs.check-release.outputs.needs_github_release == 'true'
+    if: >-
+      github.repository == 'vercel-labs/agent-browser' &&
+      (needs.check-release.outputs.should_release == 'true' || needs.check-release.outputs.needs_github_release == 'true')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -233,7 +236,9 @@ jobs:
   publish:
     name: Publish to npm
     needs: [check-release, build-binaries]
-    if: needs.check-release.outputs.should_release == 'true'
+    if: >-
+      github.repository == 'vercel-labs/agent-browser' &&
+      needs.check-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: Release
@@ -311,6 +316,7 @@ jobs:
     name: Publish sandbox package to npm
     needs: [check-release, publish]
     if: >-
+      github.repository == 'vercel-labs/agent-browser' &&
       always() &&
       needs.check-release.outputs.should_publish_sandbox == 'true' &&
       (
@@ -351,6 +357,7 @@ jobs:
     name: Publish Eve package to npm
     needs: [check-release, publish, publish-sandbox]
     if: >-
+      github.repository == 'vercel-labs/agent-browser' &&
       always() &&
       needs.check-release.outputs.should_publish_eve == 'true' &&
       (
@@ -395,6 +402,7 @@ jobs:
     name: Create GitHub Release
     needs: [check-release, build-binaries, publish, publish-sandbox, publish-eve]
     if: >-
+      github.repository == 'vercel-labs/agent-browser' &&
       always() &&
       needs.build-binaries.result == 'success' &&
       needs.check-release.outputs.needs_github_release == 'true' &&
